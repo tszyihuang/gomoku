@@ -12,8 +12,8 @@ import os
 from flask import Flask, jsonify, request
 
 from gomoku import GomokuEnv
-from minimax import minimax_opponent
-from mcts import mcts_opponent
+from 古典算法.minimax import minimax_opponent
+from 古典算法.mcts import mcts_opponent
 
 # ==============================================================================
 #  AlphaZero 模型加载（启动时一次性加载）

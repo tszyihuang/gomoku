@@ -4,5 +4,3 @@ __pycache__/
 
 # 忽略 VS Code 的本地设置文件夹
 .vscode/
-
-checkpoints/

@@ -20,8 +20,8 @@ import numpy as np
 import torch
 
 from gomoku import GomokuEnv
-from minimax import MinimaxPlayer
-from mcts import MCTSPlayer
+from 古典算法.minimax import MinimaxPlayer
+from 古典算法.mcts import MCTSPlayer
 from alphazero import PolicyValueNet, MCTS as AlphaZeroMCTS, _unwrap_state_dict
 
 
