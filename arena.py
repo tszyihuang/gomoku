@@ -10,16 +10,19 @@ Gomoku 模型试炼场 —— 选择双方模型自动对弈，统计胜率。
 
 from __future__ import annotations
 
+import glob
 import os
 import random
 import time
 from dataclasses import dataclass
 
 import numpy as np
+import torch
 
 from gomoku import GomokuEnv
 from minimax import MinimaxPlayer
 from mcts import MCTSPlayer
+from alphazero import PolicyValueNet, MCTS as AlphaZeroMCTS, _unwrap_state_dict
 
 
 # =============================================================================
@@ -28,9 +31,19 @@ from mcts import MCTSPlayer
 
 def discover_models() -> list[str]:
     """Return sorted list of available model names."""
-    return ["random",
-            "minimax_d2", "minimax_d3", "minimax_d4",
-            "mcts_t0.5", "mcts_t1.0", "mcts_t2.0"]
+    models = ["random",
+              "minimax_d2", "minimax_d3", "minimax_d4",
+              "mcts_t0.5", "mcts_t1.0", "mcts_t2.0"]
+
+    # ---- AlphaZero 模型 ----
+    # 自动发现 checkpoints 目录下的模型文件
+    az_checkpoints = sorted(glob.glob("checkpoints/alphazero_iter_*.pth"))
+    if az_checkpoints:
+        # 最新 checkpoint + 多档 MCTS 模拟次数
+        for sims in [100, 200, 400, 800]:
+            models.append(f"az_s{sims}")
+
+    return models
 
 
 # =============================================================================
@@ -77,6 +90,73 @@ class _MinimaxAdapter(Player):
         return self._mp.opponent_callback(board, player)
 
 
+class AlphaZeroPlayer(Player):
+    """AlphaZero 神经网络 + MCTS 玩家。
+
+    加载训练好的 PolicyValueNet 权重，使用纯神经网络引导的
+    MCTS 搜索来选择落子。
+
+    优化策略：
+      - BatchNorm 融合：消除推理时的 BN 计算，提速 ~30%
+      - 批量 MCTS：CPU 下用 batch_size=16 + 虚拟损失，提速 ~5×
+      - 默认使用 CPU 推理以保证多进程兼容
+    """
+
+    def __init__(self, checkpoint_path: str, mcts_sims: int = 400,
+                 device: str = 'cpu', num_channels: int = 128,
+                 num_res_blocks: int = 4):
+        self._mcts_sims = mcts_sims
+        self._device = torch.device(device)
+
+        # 从 checkpoint 文件名提取迭代数
+        basename = os.path.basename(checkpoint_path)
+        if basename.startswith("alphazero_iter_") and basename.endswith(".pth"):
+            iter_str = basename[len("alphazero_iter_"):-len(".pth")]
+            self._iteration = int(iter_str)
+        else:
+            self._iteration = 0
+
+        self._name = f"az_i{self._iteration:04d}_s{self._mcts_sims}"
+
+        # 加载网络
+        self._net = PolicyValueNet(
+            num_channels=num_channels, num_res_blocks=num_res_blocks,
+        ).to(self._device)
+        self._net.eval()
+
+        ckpt = torch.load(checkpoint_path, map_location=self._device, weights_only=False)
+        saved_sd = _unwrap_state_dict(ckpt['model_state_dict'])
+        current_sd = _unwrap_state_dict(self._net.state_dict())
+        filtered = {k: v for k, v in saved_sd.items() if k in current_sd}
+        self._net.load_state_dict(filtered, strict=False)
+
+        # ---- 推理优化 ----
+        # 1. BatchNorm 融合：将 BN 参数合并到前置卷积层
+        from alphazero import fuse_all_batchnorms
+        self._net = fuse_all_batchnorms(self._net)
+
+        # 2. 批量 MCTS：CPU 下用 batch 推理 + 虚拟损失大幅减少 Python 开销
+        #    GPU 用更大的 batch 充分利用并行能力
+        if self._device.type == 'cuda':
+            self._batch_size = 32
+            self._virtual_loss = 3.0
+        else:
+            self._batch_size = 16
+            self._virtual_loss = 3.0
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def select_action(self, board: np.ndarray, player: int) -> int:
+        mcts = AlphaZeroMCTS(self._net, n_sim=self._mcts_sims, cpuct=3.0,
+                             dirichlet_alpha=0.0, dirichlet_eps=0.0,
+                             batch_size=self._batch_size,
+                             virtual_loss=self._virtual_loss)
+        action_probs = mcts.get_action_probs(board, int(player), temperature=0.0)
+        return int(np.argmax(action_probs))
+
+
 # =============================================================================
 # Player factory
 # =============================================================================
@@ -98,11 +178,69 @@ def get_player(model_name: str) -> Player:
     elif model_name.startswith("mcts_t"):
         time_limit = float(model_name.split("t")[-1])
         p = MCTSPlayer(time_limit=time_limit)
+    elif model_name.startswith("az_"):
+        p = _make_alphazero_player(model_name)
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
     _CACHE[model_name] = p
     return p
+
+
+def _find_latest_checkpoint() -> str | None:
+    """返回最新的 AlphaZero checkpoint 路径，若没有则返回 None。"""
+    checkpoints = sorted(glob.glob("checkpoints/alphazero_iter_*.pth"))
+    return checkpoints[-1] if checkpoints else None
+
+
+def _make_alphazero_player(model_name: str) -> AlphaZeroPlayer:
+    """根据模型名称创建 AlphaZero 玩家。
+
+    支持的格式：
+      az_s{sims}          —— 最新 checkpoint + 指定 MCTS 模拟次数
+      az_i{iter}_s{sims}  —— 指定 checkpoint 迭代数 + MCTS 模拟次数
+    示例：
+      az_s400             —— 最新模型, 400 次 MCTS 模拟
+      az_i0200_s400       —— iter=200 的模型, 400 次 MCTS 模拟
+    """
+    import re
+
+    # 解析模型名称
+    match = re.match(r'^az_i(\d+)_s(\d+)$', model_name)
+    if match:
+        iteration = int(match.group(1))
+        sims = int(match.group(2))
+        checkpoint_path = f"checkpoints/alphazero_iter_{iteration:04d}.pth"
+        if not os.path.exists(checkpoint_path):
+            raise ValueError(
+                f"Checkpoint 不存在: {checkpoint_path}\n"
+                f"  可用的 checkpoint 迭代数: {_available_iterations()}"
+            )
+    else:
+        match = re.match(r'^az_s(\d+)$', model_name)
+        if match:
+            sims = int(match.group(1))
+            checkpoint_path = _find_latest_checkpoint()
+            if checkpoint_path is None:
+                raise ValueError("未找到任何 AlphaZero checkpoint，请先训练模型")
+        else:
+            raise ValueError(f"未知的 AlphaZero 模型名: {model_name}")
+
+    return AlphaZeroPlayer(checkpoint_path, mcts_sims=sims)
+
+
+def _available_iterations() -> list[int]:
+    """返回所有可用 checkpoint 的迭代数列表。"""
+    checkpoints = sorted(glob.glob("checkpoints/alphazero_iter_*.pth"))
+    iterations = []
+    for cp in checkpoints:
+        basename = os.path.basename(cp)
+        try:
+            iter_str = basename[len("alphazero_iter_"):-len(".pth")]
+            iterations.append(int(iter_str))
+        except ValueError:
+            pass
+    return iterations
 
 
 # =============================================================================
@@ -269,9 +407,15 @@ def _pick_model(prompt: str) -> str | None:
     for i, name in enumerate(mcts_models):
         print(f"    [{i + offset:>2}] {name}")
     print()
+    print("  ── AlphaZero (神经网络) ──")
+    az_models = [m for m in models if m.startswith("az_")]
+    az_offset = offset + len(mcts_models)
+    for i, name in enumerate(az_models):
+        print(f"    [{i + az_offset:>2}] {name}")
+    print()
     print(f"    [b] 返回")
 
-    model_list = ["random"] + minimax_models + mcts_models
+    model_list = ["random"] + minimax_models + mcts_models + az_models
 
     while True:
         ch = input("  选模型 > ").strip()

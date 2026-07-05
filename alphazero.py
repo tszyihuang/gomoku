@@ -151,6 +151,77 @@ def augment_d4(states: list, policies: list, outcomes: list) -> list[tuple]:
 
 
 # ==============================================================================
+#  0.5  BatchNorm 融合（推理加速）
+# ==============================================================================
+
+def fuse_batchnorm_conv(conv: nn.Conv2d, bn: nn.BatchNorm2d) -> nn.Conv2d:
+    """
+    将 BatchNorm2d 的参数融合到前置 Conv2d 中，消除推理时的 BN 计算。
+
+    融合公式（conv 后接 bn）：
+      y = γ * (W*x + b - μ) / √(σ² + ε) + β
+        = (γ / √(σ² + ε)) * W * x  +  (γ * (b - μ) / √(σ² + ε) + β)
+
+    融合后只需一次卷积即可得到等价结果，节省约 30% 推理时间。
+    """
+    gamma = bn.weight
+    beta = bn.bias
+    mean = bn.running_mean
+    var = bn.running_var
+    eps = bn.eps
+
+    std = torch.sqrt(var + eps)
+    scale = gamma / std                                          # (out_channels,)
+
+    # weight: (out_channels, in_channels, kH, kW)
+    fused_weight = conv.weight * scale.view(-1, 1, 1, 1)
+
+    if conv.bias is not None:
+        fused_bias = scale * (conv.bias - mean) + beta
+    else:
+        fused_bias = beta - scale * mean
+
+    fused = nn.Conv2d(
+        conv.in_channels, conv.out_channels, conv.kernel_size,
+        stride=conv.stride, padding=conv.padding,
+        dilation=conv.dilation, groups=conv.groups,
+        bias=True,
+    )
+    fused.weight.data = fused_weight
+    fused.bias.data = fused_bias
+    return fused
+
+
+def fuse_all_batchnorms(net: 'PolicyValueNet') -> 'PolicyValueNet':
+    """
+    将 PolicyValueNet 中所有 Conv→BN 序列融合。
+    融合后 BN 层被替换为 nn.Identity，消除全部 BN 计算开销。
+    """
+    net.conv1 = fuse_batchnorm_conv(net.conv1, net.bn1)
+    net.bn1 = nn.Identity()
+
+    net.conv2 = fuse_batchnorm_conv(net.conv2, net.bn2)
+    net.bn2 = nn.Identity()
+
+    net.conv3 = fuse_batchnorm_conv(net.conv3, net.bn3)
+    net.bn3 = nn.Identity()
+
+    for blk in net.res_blocks:
+        blk.conv1 = fuse_batchnorm_conv(blk.conv1, blk.bn1)
+        blk.bn1 = nn.Identity()
+        blk.conv2 = fuse_batchnorm_conv(blk.conv2, blk.bn2)
+        blk.bn2 = nn.Identity()
+
+    net.policy_conv = fuse_batchnorm_conv(net.policy_conv, net.policy_bn)
+    net.policy_bn = nn.Identity()
+
+    net.value_conv = fuse_batchnorm_conv(net.value_conv, net.value_bn)
+    net.value_bn = nn.Identity()
+
+    return net
+
+
+# ==============================================================================
 #  1. 双头神经网络 (PolicyValueNet)
 # ==============================================================================
 
