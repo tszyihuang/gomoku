@@ -821,7 +821,7 @@ def main():
     if device.type == 'cuda':
         print(f'  GPU 型号:     {torch.cuda.get_device_name(0)}')
         print(f'  CUDA 版本:    {torch.version.cuda}')
-        total_vram = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+        total_vram = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         print(f'  显存总量:     {total_vram:.1f} GB')
         print(f'  AMP 混合精度: {"启用" if use_amp else "禁用"}')
     else:
