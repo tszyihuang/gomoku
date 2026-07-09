@@ -432,9 +432,11 @@ class MCTS:
         self.dirichlet_eps = dirichlet_eps
         self.batch_size = batch_size
         self.virtual_loss = virtual_loss
+        self._last_root: _TreeNode | None = None  # 上一步搜索根节点，用于子树复用
 
     def get_action_probs(self, board: np.ndarray, current_player: int,
-                         temperature: float = 1.0) -> np.ndarray:
+                         temperature: float = 1.0,
+                         reuse_root: _TreeNode | None = None) -> np.ndarray:
         """
         对给定棋盘状态执行 MCTS 搜索，返回每个动作的概率分布 π。
 
@@ -457,16 +459,35 @@ class MCTS:
             probs[legal_actions[0]] = 1.0
             return probs
 
-        # ---- 创建根节点并预展开 ----
-        root = _TreeNode()
-        state_tensor = board_to_tensor(board, current_player)
-        nn_probs, _ = self.net.predict(state_tensor)
+        # ---- 创建或复用根节点 ----
+        # AlphaGo Zero 论文做法：上一步落子对应的子节点成为新根节点，
+        # 其子树及全部统计量被保留，树的其余部分丢弃。
+        if reuse_root is not None:
+            root = reuse_root
+            # 清理已不合法的子节点（棋盘上新落子导致该位置不可用）
+            legal_set = set(legal_actions)
+            stale = [a for a in root.children if a not in legal_set]
+            for a in stale:
+                del root.children[a]
+            # 用新鲜 NN 评估更新先验概率，并添加新子节点（如有）
+            state_tensor = board_to_tensor(board, current_player)
+            nn_probs, _ = self.net.predict(state_tensor)
+            for action in legal_actions:
+                if action in root.children:
+                    root.children[action].P = float(nn_probs[action])
+                else:
+                    root.children[action] = _TreeNode(
+                        parent=root, action=action, prior=float(nn_probs[action]))
+        else:
+            root = _TreeNode()
+            state_tensor = board_to_tensor(board, current_player)
+            nn_probs, _ = self.net.predict(state_tensor)
 
-        legal_probs = np.array([nn_probs[a] for a in legal_actions], dtype=np.float64)
-        legal_probs = legal_probs / legal_probs.sum()
+            legal_probs = np.array([nn_probs[a] for a in legal_actions], dtype=np.float64)
+            legal_probs = legal_probs / legal_probs.sum()
 
-        for i, action in enumerate(legal_actions):
-            root.children[action] = _TreeNode(parent=root, action=action, prior=float(legal_probs[i]))
+            for i, action in enumerate(legal_actions):
+                root.children[action] = _TreeNode(parent=root, action=action, prior=float(legal_probs[i]))
 
         # ---- 狄利克雷噪声（仅在 alpha > 0 时添加，对弈模式可设为 0 跳过） ----
         if self.dirichlet_alpha > 0:
@@ -499,6 +520,7 @@ class MCTS:
             visits_pow = visits ** (1.0 / temperature)
             probs = (visits_pow / visits_pow.sum()).astype(np.float32)
 
+        self._last_root = root  # 保存根节点，供下一时间步子树复用（论文做法）
         return probs
 
     # ==========================================================================
@@ -511,6 +533,8 @@ class MCTS:
           1. Selection  → 沿 PUCT 走到叶节点
           2. Expansion  → 用神经网络评估并展开
           3. Backup     → 将评估值沿路径向上传播
+
+        优化：终局检测只在新叶子节点进行，内部节点已认证为非终局。
         """
         node = root
         sim_board = board
@@ -522,12 +546,15 @@ class MCTS:
             r, c = divmod(node.action, 8)
             sim_board[r, c] = sim_player
             path.append(node)
+            sim_player = 3 - sim_player
 
-            if check_winner_from(sim_board, sim_player, r, c, GomokuEnv.CONNECT):
+        # 到达叶节点：检查上一步落子是否导致终局
+        if node is not root:
+            last_player = 3 - sim_player
+            r, c = divmod(node.action, 8)
+            if check_winner_from(sim_board, last_player, r, c, GomokuEnv.CONNECT):
                 self._backup(path, -1.0)
                 return
-
-            sim_player = 3 - sim_player
 
         if np.all(sim_board != 0):
             value = 0.0
@@ -607,6 +634,9 @@ class MCTS:
 
         返回 (leaf_node, leaf_board, leaf_player, path) 供后续批量推理使用。
         如果遇到终局或平局则直接回溯并返回 None。
+
+        优化：终局检测只在新叶子节点进行。内部节点（已有 children）
+        在之前模拟中已验证非终局，无需重复检测。
         """
         node = root
         sim_board = board
@@ -625,12 +655,16 @@ class MCTS:
             # U = cpuct * P * sqrt(N_parent) / (1 + N) → N 变大 → U 变小
             node.N += self.virtual_loss
             path.append(node)
+            sim_player = 3 - sim_player
 
-            if check_winner_from(sim_board, sim_player, r, c, GomokuEnv.CONNECT):
+        # 到达叶节点：检查上一步落子是否导致终局
+        # node.action 的落子方是 3-sim_player（翻转前的玩家）
+        if node is not root:
+            last_player = 3 - sim_player
+            r, c = divmod(node.action, 8)
+            if check_winner_from(sim_board, last_player, r, c, GomokuEnv.CONNECT):
                 self._backup(path, -1.0, virtual=self.virtual_loss)
                 return None
-
-            sim_player = 3 - sim_player
 
         if np.all(sim_board != 0):
             self._backup(path, 0.0, virtual=self.virtual_loss)
@@ -651,19 +685,16 @@ class MCTS:
         当使用虚拟损失时，child.Q 和 child.N 已包含虚拟损失的贡献，
         PUCT 公式会自动将"被虚拟损失惩罚"的节点排在后面。
         """
-        sqrt_parent_N = math.sqrt(node.N + 1e-8)
+        # 预计算常数部分，避免每次迭代重复
+        c = self.cpuct * math.sqrt(node.N + 1e-8)
         best_score = -float('inf')
         best_child = None
 
         for child in node.children.values():
-            if child.N > 0:
-                q_value = -child.Q / child.N
-            else:
-                q_value = 0.0
-
-            u_value = self.cpuct * child.P * sqrt_parent_N / (1.0 + child.N)
-            score = q_value + u_value
-
+            n = child.N
+            q = -child.Q / n if n > 0 else 0.0
+            u = c * child.P / (1.0 + n)
+            score = q + u
             if score > best_score:
                 best_score = score
                 best_child = child
@@ -736,6 +767,9 @@ def play_one_game(net: PolicyValueNet, config: SelfPlayConfig | None = None
     policies: list[np.ndarray] = []
     players: list[int] = []  # 记录每步是谁走的
 
+    # 子树复用（AlphaGo Zero 论文做法：上一步落子对应的子节点成为新根节点）
+    reuse_root: _TreeNode | None = None
+
     step = 0
     while True:
         # 构建神经网络输入
@@ -745,7 +779,8 @@ def play_one_game(net: PolicyValueNet, config: SelfPlayConfig | None = None
         temperature = 1.0 if step < config.temperature_threshold else 0.0
 
         # MCTS 搜索
-        action_probs = mcts.get_action_probs(board, current_player, temperature)
+        action_probs = mcts.get_action_probs(board, current_player, temperature,
+                                              reuse_root=reuse_root)
 
         # 记录数据
         states.append(state_tensor)
@@ -758,6 +793,13 @@ def play_one_game(net: PolicyValueNet, config: SelfPlayConfig | None = None
         else:
             # np.random.choice 按概率采样
             action = int(np.random.choice(64, p=action_probs))
+
+        # 为下一步准备子树复用："对应于所下动作的子节点成为新的根节点"
+        if mcts._last_root is not None and action in mcts._last_root.children:
+            reuse_root = mcts._last_root.children[action]
+            reuse_root.parent = None  # 脱离旧树
+        else:
+            reuse_root = None
 
         # 执行动作
         next_board, reward, terminated, truncated, info = env.step(action)
@@ -839,7 +881,7 @@ def _cpu_worker_play_game(seed: int) -> list[tuple]:
 
 def _gpu_worker(weight_path: str, num_channels: int, num_res_blocks: int,
                 config: SelfPlayConfig, seeds: list[int],
-                result_queue: mp.Queue, worker_id: int):
+                result_queue: mp.Queue, worker_id: int, gpu_id: int = 0):
     """
     GPU worker 进程：持有独立 GPU 网络副本，批量 MCTS 推理。
 
@@ -848,8 +890,9 @@ def _gpu_worker(weight_path: str, num_channels: int, num_res_blocks: int,
       2. 顺序运行分配的 games（每个 game 内 MCTS 批量推理 batch=32）
       3. 多个 worker 同时跑 → GPU 利用率大幅提升
     """
-    # 每个 worker 独立初始化 CUDA
-    device = torch.device('cuda')
+    # 每个 worker 绑定到指定 GPU，独立初始化 CUDA
+    device = torch.device(f'cuda:{gpu_id}')
+    torch.cuda.set_device(gpu_id)
     torch.set_float32_matmul_precision('high')
     torch.manual_seed(worker_id * 10000 + seeds[0] if seeds else 0)
 
@@ -950,17 +993,19 @@ def _run_selfplay(net: PolicyValueNet, config: SelfPlayConfig,
             end = (i + 1) * num_games // num_workers
             seed_chunks.append(all_seeds[start:end])
 
-        # 启动 GPU worker 进程
+        # 启动 GPU worker 进程（轮询分配到多张 GPU）
+        num_gpus = torch.cuda.device_count()
         ctx = mp.get_context('spawn')
         result_queue = ctx.Queue()
         workers = []
         for i in range(num_workers):
             if not seed_chunks[i]:
                 continue
+            gpu_id = i % num_gpus  # 轮询分配：worker 0→GPU0, 1→GPU1, 2→GPU2, 3→GPU0, ...
             p = ctx.Process(
                 target=_gpu_worker,
                 args=(weight_path, num_channels, num_res_blocks,
-                      config, seed_chunks[i], result_queue, i),
+                      config, seed_chunks[i], result_queue, i, gpu_id),
                 daemon=True,
             )
             p.start()
@@ -975,7 +1020,7 @@ def _run_selfplay(net: PolicyValueNet, config: SelfPlayConfig,
 
         elapsed = time.perf_counter() - t_start
         total_moves = sum(len(g) // 8 for g in results)
-        print(f'    [GPU×{num_workers}] {num_games} 局完成: '
+        print(f'    [GPU×{num_workers}@{num_gpus}] {num_games} 局完成: '
               f'{elapsed:.1f}s ({elapsed/num_games:.1f}s/局, '
               f'~{total_moves} 原始步)')
 
@@ -1198,7 +1243,7 @@ def main():
                         help='每轮训练 epoch 数')
     parser.add_argument('--batch-size', type=int, default=2048,
                         help='批次大小')
-    parser.add_argument('--iterations', type=int, default=200,
+    parser.add_argument('--iterations', type=int, default=2000,
                         help='总迭代轮数')
     parser.add_argument('--mcts-sims', type=int, default=600,
                         help='MCTS 模拟次数（8×8 推荐 400-800，冷启动阶段越多越好）')
@@ -1282,7 +1327,8 @@ def main():
     print('=' * 60)
     print(f'  计算设备:     {device}')
     if device.type == 'cuda':
-        print(f'  GPU 型号:     {torch.cuda.get_device_name(0)}')
+        print(f'  GPU 数量:     {torch.cuda.device_count()}')
+        print(f'  GPU 0 型号:   {torch.cuda.get_device_name(0)}')
         print(f'  CUDA 版本:    {torch.version.cuda}')
         print(f'  显存总量:     {torch.cuda.get_device_properties(0).total_memory / (1024**3):.1f} GB')
         print(f'  AMP 混合精度: {"启用" if use_amp else "禁用"}')
@@ -1339,7 +1385,7 @@ def main():
     if args.mcts_batch_size > 0:
         mcts_batch_size = args.mcts_batch_size
     elif selfplay_mode in ('GPU_parallel', 'GPU_seq'):
-        mcts_batch_size = 32   # GPU 模式：批量推理 + 虚拟损失
+        mcts_batch_size = 64   # GPU 模式：批量推理 + 虚拟损失
     else:
         mcts_batch_size = 1    # CPU 模式：顺序模拟
 
